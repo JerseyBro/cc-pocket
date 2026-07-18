@@ -8,7 +8,6 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
-import java.nio.file.Path
 
 /**
  * Reads OpenCode sessions from the SQLite database (~/.local/share/opencode/opencode.db)
@@ -20,14 +19,15 @@ object OpenCodeTranscriptScanner {
 
     /** All OpenCode sessions whose directory matches [workdir], newest-first. */
     fun scan(workdir: String): List<SessionSummary> {
-        val dbPath = OpenCodePaths.database()
-        if (!dbPath.toFile().exists()) return emptyList()
         return runCatching {
-            val conn = java.sql.DriverManager.getConnection("jdbc:sqlite:${dbPath.toFile().absolutePath}")
+            val conn = OpenCodePaths.connectReadOnly() ?: return emptyList()
             conn.use {
                 val stmt = it.prepareStatement(
-                    "SELECT id, title, directory, model, cost, tokens_input, tokens_output, time_created, time_updated " +
-                    "FROM session WHERE time_archived IS NULL ORDER BY time_updated DESC LIMIT 200"
+                    "SELECT s.id, s.title, s.directory, s.model, s.cost, " +
+                    "s.tokens_input, s.tokens_output, s.time_created, s.time_updated, " +
+                    "COUNT(m.id) AS msg_count " +
+                    "FROM session s LEFT JOIN message m ON m.session_id = s.id " +
+                    "WHERE s.time_archived IS NULL GROUP BY s.id ORDER BY s.time_updated DESC LIMIT 200"
                 )
                 val rs = stmt.executeQuery()
                 val out = mutableListOf<SessionSummary>()
@@ -35,9 +35,9 @@ object OpenCodeTranscriptScanner {
                     val sid = rs.getString("id") ?: continue
                     val title = rs.getString("title") ?: sid
                     val directory = rs.getString("directory") ?: ""
-                    val model = rs.getString("model")
+                    val model = parseModel(rs.getString("model"))
                     val timeUpdated = rs.getLong("time_updated")
-                    val timeCreated = rs.getLong("time_created")
+                    val msgCount = rs.getInt("msg_count")
                     if (workdir.isNotBlank() && directory.isNotBlank()) {
                         if (ProjectPaths.normCwd(directory) != ProjectPaths.normCwd(workdir)) continue
                     }
@@ -45,12 +45,13 @@ object OpenCodeTranscriptScanner {
                         sessionId = sid,
                         title = title.takeIf { it.isNotBlank() } ?: sid,
                         firstPrompt = title,
-                        messageCount = 0, // not easily countable without N+1 query
+                        messageCount = msgCount,
                         cwd = directory,
                         lastModified = timeUpdated,
                         version = null,
                         live = System.currentTimeMillis() - timeUpdated < LIVE_WINDOW_MS,
                         agent = AgentKind.OPENCODE,
+                        model = model,
                     ))
                 }
                 out
@@ -58,12 +59,22 @@ object OpenCodeTranscriptScanner {
         }.getOrElse { emptyList() }
     }
 
+    fun resumeModel(sessionId: String): String? {
+        return runCatching {
+            val conn = OpenCodePaths.connectReadOnly() ?: return null
+            conn.use {
+                val stmt = it.prepareStatement("SELECT model FROM session WHERE id = ? LIMIT 1")
+                stmt.setString(1, sessionId)
+                val rs = stmt.executeQuery()
+                if (rs.next()) parseModel(rs.getString("model")) else null
+            }
+        }.getOrNull()
+    }
+
     /** Every directory with OpenCode sessions → its newest session mtime. */
     fun cwdsByNewest(): Map<String, Long> {
-        val dbPath = OpenCodePaths.database()
-        if (!dbPath.toFile().exists()) return emptyMap()
         return runCatching {
-            val conn = java.sql.DriverManager.getConnection("jdbc:sqlite:${dbPath.toFile().absolutePath}")
+            val conn = OpenCodePaths.connectReadOnly() ?: return emptyMap()
             conn.use {
                 val stmt = it.prepareStatement(
                     "SELECT directory, MAX(time_updated) as mtime FROM session WHERE time_archived IS NULL AND directory IS NOT NULL GROUP BY directory"
@@ -78,5 +89,23 @@ object OpenCodeTranscriptScanner {
                 out
             }
         }.getOrDefault(emptyMap())
+    }
+
+    internal fun parseModel(raw: String?): String? {
+        val text = raw?.trim()?.takeIf { it.isNotBlank() } ?: return null
+        if (!text.startsWith("{")) return text.takeIf { "/" in it }
+        return runCatching {
+            val obj = json.parseToJsonElement(text).jsonObject
+            val provider = obj["providerID"]?.jsonPrimitive?.contentOrNull
+                ?: obj["provider"]?.jsonPrimitive?.contentOrNull
+            val id = obj["id"]?.jsonPrimitive?.contentOrNull
+                ?: obj["modelID"]?.jsonPrimitive?.contentOrNull
+                ?: obj["model"]?.jsonPrimitive?.contentOrNull
+            when {
+                provider.isNullOrBlank() || id.isNullOrBlank() -> null
+                "/" in id -> id
+                else -> "$provider/$id"
+            }
+        }.getOrNull()
     }
 }

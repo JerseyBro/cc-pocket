@@ -3,6 +3,8 @@ package dev.ccpocket.daemon.conversation
 import dev.ccpocket.daemon.agent.AgentBackend
 import dev.ccpocket.daemon.agent.AgentEvent
 import dev.ccpocket.daemon.agent.AgentIo
+import dev.ccpocket.daemon.agent.AgentProcessMode
+import dev.ccpocket.daemon.agent.AgentPromptDelivery
 import dev.ccpocket.daemon.agent.AgentProcess
 import dev.ccpocket.daemon.agent.AgentSpec
 import dev.ccpocket.daemon.agent.ApprovalTimeout
@@ -326,7 +328,33 @@ class Conversation(
         }
     }
 
+    // which generation already settled its launch prompt — the settle runs ONCE per process (SessionInit
+    // normally; TurnResult only as the fallback for a stream that carried no step_start). Without this
+    // guard the TurnResult call would ALSO fire and eat a QUEUED prompt recorded mid-turn under the same
+    // generation, silently dropping it from the one-shot drain.
+    @Volatile
+    private var initialArgSettledGen = -1L
+
+    /** One-shot argv prompts have no stdin replay; the process accepting the turn settles the launch prompt. */
+    private fun settleInitialArgPrompt() = synchronized(promptLedger) {
+        if (initialArgSettledGen == processGeneration) return@synchronized
+        initialArgSettledGen = processGeneration
+        val iter = promptLedger.iterator()
+        while (iter.hasNext()) {
+            val entry = iter.next()
+            if (entry.generation == processGeneration) {
+                iter.remove()
+                return@synchronized
+            }
+        }
+    }
+
     private fun hasUnconsumedPrompts(): Boolean = synchronized(promptLedger) { promptLedger.isNotEmpty() }
+
+    /** One-shot queue drain: the oldest queued prompt leaves the ledger to become the next spawn's
+     *  argv message — launchProcess re-records it (initialSend) under the fresh generation, so the
+     *  usual SessionInit settle applies. Pop-then-re-record keeps exactly one live copy. */
+    private fun popQueuedPrompt(): PendingPrompt? = synchronized(promptLedger) { promptLedger.removeFirstOrNull() }
 
     /** /clear + switchDirectory: the old session's undelivered prompts must not leak into a fresh one. */
     private fun clearPromptLedger() = synchronized(promptLedger) { promptLedger.clear() }
@@ -412,6 +440,11 @@ class Conversation(
         // break "tap to take over" and could let two writers clobber one transcript. Codex ignores forkSession; a
         // null resumeId is a brand-new session either way.
         if (takeOver) {
+            // [resumeId] is valid for every backend here: for OpenCode it is the REAL opencode session id
+            // (the scanner read it out of opencode.db — the registry keys conversations by that same id),
+            // so a take-over of a disk session resumes it instead of silently forking a fresh one. The
+            // eager launch below is still a no-op for OpenCode (argv needs a prompt; the guard in
+            // launchProcess defers to the first sendPrompt, which anchors on sessionId ?: openedResumeId).
             launchProcess(AgentSpec(workdir, resumeId, model, mode, effort = effort, forkSession = fork))
         }
         // a headless agent (claude `--input-format stream-json`; codex pre-thread) emits NOTHING — not even the
@@ -679,10 +712,17 @@ class Conversation(
         if (rule == null) allowRules.clear() else allowRules.remove(rule)
     }
 
-    // GUEST folder-share (issue #115): a scoped guest conversation launches its agent clean-room — no MCP
-    // servers — so it can't reach the owner's authenticated integrations. One place to stamp it: every
-    // AgentSpec built above flows through here, so the launch flags carry it without touching each site.
-    private val cleanRoom: Boolean = pathScope != null
+    // Restricted-credential conversations (GUEST folder-share #115, BRIDGE #91) launch their agent
+    // clean-room: no MCP servers (can't act through the owner's authenticated integrations) and — the part
+    // that bit for real — `--setting-sources ""`, because the owner's own ~/.claude settings carry
+    // permissions.allow rules accumulated for their PERSONAL convenience (a bare "Edit" was live on the
+    // machine this shipped from), and the CLI honours those BEFORE the daemon's --permission-prompt-tool
+    // ever hears about the call. A stranger in an IM chat inheriting the owner's "don't ask me again"
+    // choices breaks the one promise the tier ceiling makes ("dangerous actions prompt your phone"), so
+    // both restricted kinds strip the settings layer and the daemon stays the sole permission authority.
+    // origin != null is exactly "bridge or guest": the scheduler and every interactive device open with a
+    // null origin. One place to stamp it: every AgentSpec built above flows through here.
+    private val cleanRoom: Boolean = launchesCleanRoom(pathScope, origin)
 
     private suspend fun launchProcess(rawSpec: AgentSpec, armExecuting: Boolean = false, initialSend: InitialSend? = null) {
         // OpenCode requires a message argument — can't launch without one (opencode run exits with error).
@@ -726,6 +766,9 @@ class Conversation(
             // a bridge-origin ask is a one-off human decision (issue #91): never offer/honor "always
             // allow", so one owner approval can't be replayed by later attacker-supplied prompts
             forceNeverRemember = origin != null,
+            // bridge defense-in-depth (issue #91): Bash gated by BridgeCommandPolicy + structured file tools
+            // confined to the bound workdir (a bridge Read must not escape to ~/.ssh). Bridge only.
+            bridgeSession = origin != null && pathScope == null,
             // GUEST folder-share (issue #115): confine every file tool to the shared roots
             pathScope = pathScope,
             workdir = workdir.toString(),
@@ -743,7 +786,11 @@ class Conversation(
         // its stdin (or its internal mid-turn queue) that never produced a consumption replay — is
         // re-handed to this fresh process, oldest first, before anything else rides it. This is the old
         // healSessionLock resend generalized to EVERY spawn: crash, shutdown, settings relaunch, lock heal.
-        val redeliver = promptsForRedelivery(processGeneration)
+        val redeliver = if (backend.promptDelivery == AgentPromptDelivery.STDIN_REPLAY) {
+            promptsForRedelivery(processGeneration)
+        } else {
+            emptyList()
+        }
         if (redeliver.isNotEmpty()) {
             executing = true // the re-injected prompts start a turn; TurnResult clears it as usual
             log.info("$convoId re-injecting ${redeliver.size} unconsumed prompt(s) into the fresh agent")
@@ -767,10 +814,14 @@ class Conversation(
         // invalid --model on a resumed session exits neither stdout nor stderr, just hangs).
         if (backend.kind == AgentKind.OPENCODE) {
             scope.launch(CoroutineName("opencode-watchdog-$convoId")) {
-                delay(OPENCODE_STARTUP_TIMEOUT_MS)
-                // still the same process? (a relaunch already replaced it → no-op)
-                if (proc === p && p.isAlive()) {
-                    log.warn("$convoId OpenCode watchdog: no stdout in ${OPENCODE_STARTUP_TIMEOUT_MS}ms, killing process ${p.pid}")
+                val windowMs = System.getProperty(OPENCODE_WATCHDOG_PROP)?.toLongOrNull() ?: OPENCODE_STARTUP_TIMEOUT_MS
+                delay(windowMs)
+                // STARTUP-only guard: fires only when the process produced ZERO stdout since launch.
+                // A healthy long turn (streaming well past the window) has sawStdout=true and is never
+                // touched — without this check every >45s turn would be killed mid-stream and misreported
+                // as a startup timeout. Same-process check: a relaunch already replaced it → no-op.
+                if (proc === p && p.isAlive() && !p.sawStdout) {
+                    log.warn("$convoId OpenCode watchdog: no stdout in ${windowMs}ms, killing process ${p.pid}")
                     intentionalStop = true
                     p.shutdown(eofGraceMs = 1_000, termGraceMs = 1_000, forceGraceMs = 1_000)
                     p.awaitExit()
@@ -784,7 +835,7 @@ class Conversation(
                     val why = p.lastStderr?.let { " — ${it.take(300)}" } ?: ""
                     sink.emit(PocketError(
                         "opencode_startup_timeout",
-                        "OpenCode did not produce any output within ${OPENCODE_STARTUP_TIMEOUT_MS / 1000}s ($why). " +
+                        "OpenCode did not produce any output within ${windowMs / 1000}s ($why). " +
                             "The model may be invalid or the session may be corrupted. Try a new session or a different model.",
                         convoId,
                     ))
@@ -820,16 +871,21 @@ class Conversation(
         // off the pump: a control-plane push must never stall stdout parsing
         scope.launch {
             val pushed = runCatching { hook.onAskPending(workdir, sessionId, origin, label, watched) }.getOrDefault(false)
+            // one line so a "why didn't my phone buzz" never again means grepping two hours of relay logs:
+            // this is the daemon-side truth of whether an ask-push was even attempted.
+            log.info("ask-push origin=${origin ?: "owner"} tool=$label watched=$watched → ${if (pushed) "queued to relay" else "not pushed"}")
             if (!pushed) lastAskPushMs = prev
         }
     }
 
     private suspend fun pump(p: AgentProcess, b: PermissionBridge) {
+        var turnCompleted = false
         for (line in p.stdout) {
             lastActivityMs = System.currentTimeMillis()
             for (ev in backend.parse(line)) {
                 when (ev) {
                     is AgentEvent.SessionInit -> {
+                        if (backend.promptDelivery == AgentPromptDelivery.INITIAL_ARG_ONE_SHOT) settleInitialArgPrompt()
                         val firstTime = sessionId == null
                         val prevSid = sessionId
                         ev.sessionId?.let { newSid ->
@@ -947,6 +1003,8 @@ class Conversation(
                         sawSyntheticThisTurn = true
                     }
                     is AgentEvent.TurnResult -> {
+                        turnCompleted = true
+                        if (backend.promptDelivery == AgentPromptDelivery.INITIAL_ARG_ONE_SHOT) settleInitialArgPrompt()
                         executing = false
                         // relaunch continuation grace anchor (issue #122 ⑤): this result may be a phantom
                         // (fable early result/fallback) — for RELAUNCH_GRACE ms after it, sendPrompt must
@@ -1032,6 +1090,41 @@ class Conversation(
             // real process exit before touching the file (intentional stops settle in stopProcess)
             executing = false // a dead process never delivers TurnResult
             p.awaitExit()
+            if (backend.processMode == AgentProcessMode.ONE_SHOT_TURN && p.exitCode() == 0 && turnCompleted) {
+                log.info("$convoId one-shot process completed normally (sid=${sessionId?.take(8) ?: "-"})")
+                // settle any card the clean exit left open (a tool_use that never reported completed)
+                for (taskId in workflows.killRunning(System.currentTimeMillis())) emitWorkflow(taskId)
+                bridge?.cancelAll()
+                bridge = null
+                // MID-TURN QUEUE, one-shot flavor: prompts that arrived while this process ran were
+                // ledgered (and acked as queued) by sendPrompt — argv can't take a second message, so
+                // the queue drains ONE per process: pop the oldest and relaunch with it as the next
+                // spawn's argv message. launchProcess re-records it as initialSend under the fresh
+                // generation, so SessionInit settles it exactly like a directly-sent prompt. Drain only
+                // on a CLEAN exit: after a crash the entries stay ledgered and the client's resend path
+                // recovers them via releaseLostPrompt (#122 ④) — auto-draining a crash would loop the
+                // same prompt into the same failure forever. No onProcessEnded: a one-shot clean exit
+                // is the turn's natural end, not a death to clean up after.
+                proc = null // dead handle dropped FIRST — a failed drain-launch below must not leave prompts writing into it
+                val next = popQueuedPrompt()
+                if (next != null) {
+                    log.info("$convoId one-shot queue: relaunching with queued prompt ${next.key.take(8)}…")
+                    runCatching {
+                        launchProcess(
+                            AgentSpec(workdir, sessionId ?: openedResumeId, model, mode, effort = effort, initialPrompt = next.text),
+                            armExecuting = true,
+                            initialSend = InitialSend(next.key, next.text, next.images),
+                        )
+                    }.onFailure { e ->
+                        executing = false // the spawn never started a turn
+                        // the popped entry is gone from the ledger — forget its id too, so the client's
+                        // resend runs it fresh instead of being hollow-re-acked as "already delivered"
+                        synchronized(seenPromptIds) { seenPromptIds.remove(next.key) }
+                        sink.emit(PocketError("agent_unavailable", "agent failed to start for a queued message (${e.message})", convoId))
+                    }
+                }
+                return
+            }
             // workflows died with the process — settle them so no card pulses forever (#106)
             for (taskId in workflows.killRunning(System.currentTimeMillis())) emitWorkflow(taskId)
             backend.onProcessEnded(sessionId)
@@ -1210,6 +1303,10 @@ class Conversation(
             // This branch is ALSO the respawn after an unexpected process death (issue #122 — the pump nulls `proc`):
             // then the live sessionId is the anchor (the dead process's turns live in ITS transcript, not the
             // originally-resumed one), resumed in place — its own id is never a foreign id to fork off.
+            // For OpenCode both anchors are REAL opencode session ids: sessionId came from step_start,
+            // openedResumeId from the SQLite scanner — a cold resume (daemon restart, tap an old session)
+            // MUST fall back to openedResumeId or the first prompt silently forks a brand-new session.
+            // A truly stale id is recovered at process death (SESSION_NOT_FOUND clears the lineage).
             val anchor = sessionId ?: openedResumeId
             val fork = if (sessionId == null) openedWithFork else false
             val launched = runCatching {
@@ -1222,6 +1319,14 @@ class Conversation(
                 sink.emit(PocketError("agent_unavailable", "agent failed to start (${launched.exceptionOrNull()?.message})", convoId))
                 return
             }
+        } else if (backend.promptDelivery == AgentPromptDelivery.INITIAL_ARG_ONE_SHOT) {
+            // ONE-SHOT mid-turn queue: the live process baked its prompt into argv and reads no stdin,
+            // so this prompt can't ride it. Ledger it — the ack below means "queued", the same receipt
+            // contract as the stdin mid-turn queue — and the pump's clean-exit hook drains the queue
+            // into the next spawn (one prompt per process). recordPromptWritten stamps the CURRENT
+            // generation, so a client resend while this turn runs is a plain re-ack (#122 ④: an entry
+            // owned by the live process is queued, not lost).
+            recordPromptWritten(promptId, text, images)
         } else {
             // queued send onto the already-live process (mid-turn queue, or a steady-state next turn):
             // no new pump is starting, so there is no death-branch to race — arm executing directly, and
@@ -1344,6 +1449,18 @@ class Conversation(
         requestInterrupt()
     }
 
+    /** A live agent process is attached right now — its CLI holds (and appends) the transcript. */
+    fun hasLiveProcess(): Boolean = proc?.isAlive() == true
+
+    /** Rename the session THROUGH the live agent (issue #158): the CLI appends its own `custom-title`
+     *  record and acks, so the daemon never appends to a transcript its child is writing. False = not
+     *  acked (no live process / backend without rename support / rejected / timeout) — the caller
+     *  reports it; it must NOT fall back to a disk append while this process lives. */
+    suspend fun renameSession(title: String): Boolean {
+        if (!hasLiveProcess()) return false
+        return backend.renameSession(title)
+    }
+
     /**
      * Stop ONE background job from the phone's task panel (issue #80). The daemon's only lever over the
      * agent's work is the interrupt control (same primitive as [cancelTurn] / the composer ■) — it can't
@@ -1458,7 +1575,7 @@ class Conversation(
         scope.cancel()
     }
 
-    private companion object {
+    companion object {
         val EFFORT_LEVELS = setOf("low", "medium", "high", "xhigh", "max")
 
         // claude's session-lock refusal on stderr: "Error: Session <id> is currently running as a
@@ -1514,13 +1631,24 @@ class Conversation(
         // PermissionBridge. Only a push that actually went out spends the window (see [maybePushAsk]).
         const val ASK_PUSH_COALESCE_MS = 60_000L
 
-        // OpenCode: max time to wait for first stdout after process launch before declaring it hung.
+        // OpenCode: max time to wait for the FIRST stdout after process launch before declaring it hung.
         // opencode run with an invalid --model on a resumed session hangs silently (no stdout, no stderr,
-        // no exit) — the pump would block forever without this watchdog.
+        // no exit) — the pump would block forever without this watchdog. Startup only: once any stdout
+        // arrived (sawStdout) the watchdog stands down — turn LENGTH is unbounded by design. Overridable
+        // (system property) so tests can exercise the window without a 45s wait.
         const val OPENCODE_STARTUP_TIMEOUT_MS = 45_000L
+        const val OPENCODE_WATCHDOG_PROP = "ccpocket.opencode.watchdogMs"
 
         // a process death this soon after a TurnResult is the SAME failure the turn's push already
         // reported (a fatal error result is often followed by the CLI exiting) — no second alert (#138)
-        const val DEATH_PUSH_QUIET_MS = 10_000L
+        private const val DEATH_PUSH_QUIET_MS = 10_000L
+
+        /** True when a conversation's agent must launch CLEAN-ROOM (no MCP, no settings sources — the
+         *  daemon is the sole permission authority). Exactly the restricted-credential conversations:
+         *  a GUEST share carries a [pathScope]; a BRIDGE carries an [origin]; the scheduler and every
+         *  interactive device carry neither. Pinned by ConversationCleanRoomTest — a regression here
+         *  silently re-opens the owner-settings bypass (a stranger inheriting "don't ask me again"). */
+        fun launchesCleanRoom(pathScope: List<String>?, origin: String?): Boolean =
+            pathScope != null || origin != null
     }
 }

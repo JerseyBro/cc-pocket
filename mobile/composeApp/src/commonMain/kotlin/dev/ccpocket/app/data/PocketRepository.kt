@@ -37,6 +37,18 @@ import dev.ccpocket.protocol.ChatRole
 import dev.ccpocket.protocol.ClearAllowRule
 import dev.ccpocket.protocol.CloseSession
 import dev.ccpocket.protocol.AccessTier
+import dev.ccpocket.protocol.BridgeCreated
+import dev.ccpocket.protocol.BridgeCredential
+import dev.ccpocket.protocol.BridgeInfo
+import dev.ccpocket.protocol.BridgeListing
+import dev.ccpocket.protocol.BridgeRevoked
+import dev.ccpocket.protocol.BridgeRunnerSpec
+import dev.ccpocket.protocol.BridgeRunnerStatus
+import dev.ccpocket.protocol.ConfigureBridgeRunner
+import dev.ccpocket.protocol.ControlBridgeRunner
+import dev.ccpocket.protocol.CreateBridge
+import dev.ccpocket.protocol.ListBridges
+import dev.ccpocket.protocol.RevokeBridge
 import dev.ccpocket.protocol.CreateShare
 import dev.ccpocket.protocol.ListShares
 import dev.ccpocket.protocol.RevokeShare
@@ -106,10 +118,16 @@ import dev.ccpocket.protocol.AuthLoginCancel
 import dev.ccpocket.protocol.AuthLoginCode
 import dev.ccpocket.protocol.AuthLogout
 import dev.ccpocket.protocol.AuthState
+import dev.ccpocket.protocol.compatibleModelForAgent
+import dev.ccpocket.protocol.isModelCompatibleWithAgent
 import dev.ccpocket.protocol.ActivatePreset
 import dev.ccpocket.protocol.DeletePreset
 import dev.ccpocket.protocol.FetchAuthStatus
+import dev.ccpocket.protocol.FetchModels
+import dev.ccpocket.protocol.AGENT_WIRE_OPENCODE
+import dev.ccpocket.protocol.ClientCaps
 import dev.ccpocket.protocol.FetchPresets
+import dev.ccpocket.protocol.ModelsList
 import dev.ccpocket.protocol.FetchSkillCatalog
 import dev.ccpocket.protocol.FetchUsage
 import dev.ccpocket.protocol.SkillCatalog
@@ -137,6 +155,7 @@ import dev.ccpocket.protocol.PushPrefs
 import dev.ccpocket.protocol.SessionGroup
 import dev.ccpocket.protocol.GroupCreate
 import dev.ccpocket.protocol.GroupRename
+import dev.ccpocket.protocol.RenameSession
 import dev.ccpocket.protocol.GroupDelete
 import dev.ccpocket.protocol.GroupAssign
 import dev.ccpocket.app.isPreviewMode
@@ -239,6 +258,10 @@ enum class ImgState { Compressing, Ready, Rejected }
 
 /** One quick-terminal command and its [ShellResult] (null while awaiting approval/result). Issue #3. */
 data class TerminalEntry(val command: String, val result: ShellResult? = null)
+
+/** A refused session rename (issue #158): [sessionId] is the row that asked, [message] the daemon's
+ *  reason — surfaced on the sessions list (the asking row), never in a chat transcript. */
+data class RenameRefusal(val sessionId: String, val message: String)
 
 /**
  * A localizable status line: the UI resolves [res] (and substitutes [arg] for %1$s when present).
@@ -542,6 +565,17 @@ class PocketRepository(private val scope: CoroutineScope, private val pinnedTo: 
      *  empty — a group-aware daemon with zero groups yet (show "+ New group" so the FIRST one is creatable)
      *  vs an older daemon / a guest connection that omits groups entirely (hide the affordance). */
     val groupsSupported = mutableStateOf(false)
+    /** True when THIS connection may rename sessions (issue #158): the daemon stamped
+     *  [Sessions.renameSupported] (owner on a rename-aware daemon). False — an older daemon or a guest —
+     *  hides the rename entry instead of sending a frame the daemon would silently drop. */
+    val renameSupported = mutableStateOf(false)
+    /** The daemon's refusal of the LAST [renameSession] attempt (issue #158), keyed to the session it
+     *  targeted. Renames are asked from the SESSIONS list, so the feedback belongs there — the most
+     *  common refusal (renaming a terminal-held session from the sidebar) happens with no chat open at
+     *  all, and whatever chat IS open is an unrelated session whose transcript must not absorb the
+     *  error line. Cleared by the next attempt / [dismissRenameError]. */
+    val renameError = mutableStateOf<RenameRefusal?>(null)
+    private var renameTarget: String? = null // the sessionId the in-flight RenameSession asked about
     val messages = mutableStateListOf<ChatItem>()
     val pendingImages = mutableStateListOf<PendingImage>() // photos staged in the composer (pre-send)
     val pendingFiles = mutableStateListOf<PendingFile>()   // files staged/uploading into the workspace inbox (issue #90)
@@ -569,6 +603,8 @@ class PocketRepository(private val scope: CoroutineScope, private val pinnedTo: 
     val viewedFileDiff = mutableStateOf<FileDiff?>(null)      // the loaded line-level diff; ok=false = none/too-old daemon
     val exportWaiting = mutableStateOf(false)                 // an ExportFile awaits the owner's approval/reply (issue #67 v2)
     val pathListing = mutableStateOf<PathEntries?>(null)     // latest @-file completion listing (issue #75); match its subPath before use
+    val browseListing = mutableStateOf<PathEntries?>(null)   // latest home-anchored folder-browse listing (issue #152); match its subPath before use
+    private var lastBrowseSub: String? = null                // subPath of the LATEST browseHomeDirs request — only its reply may land in browseListing (#152 复核: stale out-of-order replies dropped)
     val mode = mutableStateOf(PermissionMode.DEFAULT)        // current execution/permission mode
     val model = mutableStateOf<String?>(null)                // daemon's actual model for this session (header + info sheet)
     val sessionAgent = mutableStateOf<AgentKind?>(null)      // backend driving this session (Claude/Codex) — header badge
@@ -1248,7 +1284,9 @@ class PocketRepository(private val scope: CoroutineScope, private val pinnedTo: 
         // ask for the list now; it buffers in the outbox and flushes once the handshake lands. Ready is
         // asserted only when the real Directories reply arrives (see handle()), never optimistically here.
         // On a reconnect, also re-sync whatever page the user is parked on (re-open a live chat, re-list sessions).
-        scope.launch { send(ListDirectories()); if (reconnect) restoreAfterReconnect() }
+        // ClientCaps FIRST: it declares this build understands agent="opencode", so the daemon stops
+        // filtering those rows out of the lists that follow (old builds never send it — see Messages.kt).
+        scope.launch { send(ClientCaps(supportsAgents = listOf(AGENT_WIRE_OPENCODE))); send(ListDirectories()); if (reconnect) restoreAfterReconnect() }
         startGrace(reconnect)
         startConnectWatchdog()
     }
@@ -1395,6 +1433,7 @@ class PocketRepository(private val scope: CoroutineScope, private val pinnedTo: 
         authState.value = null
         presetsState.value = null; presetsStateRev.value = 0
         gatewayBaseUrl.value = null // per-daemon truth (issue #139): the next machine re-announces via DaemonInfo
+        bridgeControl.value = null  // per-daemon truth too — the next daemon re-advertises via DaemonInfo (issue #91)
         // per-daemon truth too: the next machine's skills/plugins are a fresh fetch (issue #132)
         skillCatalogDeadline?.cancel()
         skillCatalog.value = null; skillCatalogLoading.value = false; skillCatalogUnavailable.value = false
@@ -1638,6 +1677,9 @@ class PocketRepository(private val scope: CoroutineScope, private val pinnedTo: 
                     ?: (frame as? GroupDelete)?.workdir ?: (frame as GroupAssign).workdir
                 handle(Sessions(wd, DemoData.sessions(wd)))
             }
+            // #158 rename: same no-persistence re-echo (the demo Sessions omits renameSupported, so the
+            // entry stays hidden anyway — this just keeps every sendable frame answered)
+            is RenameSession -> handle(Sessions(frame.workdir, DemoData.sessions(frame.workdir)))
             is OpenSession -> {
                 val cid = "demo-convo-${frame.resumeId ?: "new"}"
                 handle(SessionLive(cid, frame.workdir, frame.resumeId ?: DemoData.LIVE_SESSION_ID, mode = frame.mode, executing = false))
@@ -1729,12 +1771,48 @@ class PocketRepository(private val scope: CoroutineScope, private val pinnedTo: 
                 sessionsDir.value = f.workdir; replace(sessions, f.items)
                 replace(sessionGroups, f.groups ?: emptyList()) // #119: null (older daemon) → no groups, flat list
                 groupsSupported.value = f.groups != null // groups=[] (owner, none yet) still enables management
+                renameSupported.value = f.renameSupported // #158: false from an older daemon / a guest
                 sessionsRefreshing.value = false
             }
             is Usage -> { usage.value = f; usageLoading.value = false }
             is SkillCatalog -> {
                 skillCatalogDeadline?.cancel()
                 skillCatalog.value = f; skillCatalogLoading.value = false; skillCatalogUnavailable.value = false
+            }
+            // headless bridges (issue #91 follow-up) — the owner's control plane replies
+            is BridgeListing -> {
+                bridgesDeadline?.cancel(); bridgeBusyDeadline?.cancel()
+                bridges.clear(); bridges.addAll(f.items)
+                bridgesLoaded.value = true; bridgesUnavailable.value = false; bridgeBusy.value = false
+            }
+            is BridgeCreated -> {
+                bridgeBusyDeadline?.cancel()
+                bridgeBusy.value = false
+                bridgeError.value = f.error
+                // only an UNMANAGED mint hands back a ticket; a managed one already gave it to its process
+                bridgeCredential.value = f.credential
+                if (f.ok) fetchBridges() // the new row (and its runner state) comes from the listing
+            }
+            is BridgeRevoked -> {
+                bridgeBusyDeadline?.cancel()
+                bridgeBusy.value = false
+                bridgeError.value = f.error
+                if (f.ok) fetchBridges()
+            }
+            is BridgeRunnerStatus -> {
+                bridgeBusyDeadline?.cancel()
+                bridgeBusy.value = false
+                bridgeError.value = f.error
+                // merge-loss guard: an OLD daemon ignores mergeEnv and replaces wholesale — keys the edit
+                // didn't retype silently die. envKeys in the reply is the proof either way.
+                pendingMergeCheck?.let { (n, prior) ->
+                    if (f.name == n) {
+                        pendingMergeCheck = null
+                        val lost = prior - (f.state?.envKeys?.toSet() ?: emptySet())
+                        if (lost.isNotEmpty()) bridgeMergeLost.value = lost.sorted()
+                    }
+                }
+                fetchBridges() // start/stop/detach all move the row's state
             }
             is AuthState -> authState.value = f
             // scheduled tasks (issue #137): the single reply to every pocket/schedule.* request
@@ -1747,6 +1825,14 @@ class PocketRepository(private val scope: CoroutineScope, private val pinnedTo: 
             // rev bumps on EVERY reply, including one equal to the last (a no-change save): UI effects
             // key on the rev, not the value, so an identical state still settles spinners/pending forms
             is PresetsState -> { presetsState.value = f; presetsStateRev.value++ }
+            is ModelsList -> {
+                // keep the LAST-GOOD list under a failed refresh: one `opencode models` timeout must
+                // not wipe a working picker back to the empty state — carry the fresh error alongside
+                val prev = agentModels[f.agent]
+                agentModels[f.agent] =
+                    if (f.error != null && f.models.isEmpty() && prev != null && prev.models.isNotEmpty()) prev.copy(error = f.error)
+                    else f
+            }
             is PushPrefs -> pushPrefs.value = f.enabled
             // the daemon told us where it lives on the LAN — persist per binding; the next connect (this
             // repo OR a rebuilt fleet satellite reading the same store) dials it before the relay. An
@@ -1764,21 +1850,26 @@ class PocketRepository(private val scope: CoroutineScope, private val pinnedTo: 
                 // gateway hint (issue #139): unconditional, incl. null — a daemon back on the official
                 // endpoint (or an old daemon omitting the field) must clear a previous gateway's value
                 gatewayBaseUrl.value = f.gatewayBaseUrl
+                bridgeControl.value = f.bridgeControl // capability advertisement (issue #91): false = daemon too old
             }
             is SessionLive -> {
                 migrateDraft(f.sessionId) // before re-keying: composerKey() still reads the old chain
                 convoId.value = f.convoId; workdir.value = f.workdir; observing.value = f.observing; currentSessionId = f.sessionId
                 f.sessionId?.let { sessionKey.value = it }
                 f.mode?.let { mode.value = it } // daemon is the source of truth — corrects the optimistic badge
-                f.model?.let { model.value = it }
                 f.effort?.let { effort.value = it }
                 f.agent?.let { sessionAgent.value = it } // daemon truth for the backend badge
+                val liveAgent = f.agent ?: sessionAgent.value ?: AgentKind.CLAUDE
+                // daemon truth verbatim: filtering the REPORTED model through the compat guard nulled
+                // legitimate ids (codex "o3", gateway "vendor/model") and wiped the header — the guard
+                // is for what we SEND (openSession seeding), never for what the daemon says is running
+                f.model?.let { model.value = it }
                 // unconditional (not ?.let): switching from a bridge session to a normal one must CLEAR the chip
                 sessionOrigin.value = f.origin // "via <bridge>" header chip (issue #91); null = interactive/old daemon
                 // window fallback is Claude-only: contextWindowFor knows nothing about gpt-* ids, and a Codex
                 // session with no daemon-sent window was rendering a % against a meaningless Claude 200k —
                 // null instead, and the UI shows raw tokens without a denominator
-                val claudeish = (f.agent ?: sessionAgent.value ?: AgentKind.CLAUDE) == AgentKind.CLAUDE
+                val claudeish = liveAgent == AgentKind.CLAUDE
                 // the user's override wins over the daemon's value (for Claude, f.contextWindow is never null and
                 // would otherwise pin a custom model at the CLI's 200k fallback — issue #60)
                 contextWindow.value = contextWindowOverride.value ?: f.contextWindow ?: (if (claudeish) contextWindowFor(f.model ?: model.value) else null)
@@ -1896,7 +1987,12 @@ class PocketRepository(private val scope: CoroutineScope, private val pinnedTo: 
             is WorkflowAgentDetail -> if (f.convoId == convoId.value) {
                 workflowAgentDetails["${f.runId}#${f.agentIndex}"] = f
             }
-            is PocketError -> {
+            is PocketError -> if (f.code == "rename_failed") {
+                // #158: a rename refusal answers to the SESSIONS surface (the sidebar/list row that
+                // asked) — the common case (renaming a terminal-held session) has no chat open, and an
+                // open chat is an UNRELATED session whose transcript must not absorb the error line.
+                renameError.value = renameTarget?.let { RenameRefusal(it, f.message) }
+            } else {
                 opening.value = false // a failed open re-enables the one-tap entries right away
                 messages.add(ChatItem.Sys(f.message)) // UI prepends the localized "error:" prefix
                 // a dead claude process never sends TurnDone — clear the streaming state here
@@ -2027,7 +2123,14 @@ class PocketRepository(private val scope: CoroutineScope, private val pinnedTo: 
             // @-file completion (issue #75): keyed on workdir, not a session id — it browses the cwd, not a
             // session's changed set. A reply for a workdir we've since left is dropped (the completer keys
             // the visible listing on its own requested subPath anyway).
-            is PathEntries -> if (f.workdir == workdir.value) pathListing.value = f
+            // The folder browser (issue #152) rides the same frame anchored at the literal "~" — a session's
+            // workdir is always a real absolute path, so the two listings can't collide on the key. Browser
+            // replies additionally pass the latest-request gate: replies can arrive out of order, and a
+            // drilled-past level's late reply must not clobber the fresh one (#152 复核, [foldBrowseReply]).
+            is PathEntries -> when (f.workdir) {
+                BROWSE_HOME -> browseListing.value = foldBrowseReply(browseListing.value, f, lastBrowseSub)
+                workdir.value -> pathListing.value = f
+            }
             // ── folder-share (issue #115): owner control-plane replies ──
             is ShareCreated -> { lastShareCreated.value = f; sharesRefreshing.value = false }
             is ShareListing -> { replace(shares, f.items); sharesLoaded.value = true; sharesRefreshing.value = false }
@@ -2212,7 +2315,20 @@ class PocketRepository(private val scope: CoroutineScope, private val pinnedTo: 
      *  with the gateway model presets. Null on the official endpoint or from a daemon that predates it. */
     val gatewayBaseUrl = mutableStateOf<String?>(null)
 
+    /** Whether the connected daemon understands the bridge control plane (issue #91), from [DaemonInfo]:
+     *  null until the first one lands, false from a daemon too old to carry the field. The Bridges screen
+     *  shows "update the daemon" up front on false, instead of waiting for a bridge fetch to time out. */
+    val bridgeControl = mutableStateOf<Boolean?>(null)
+
     fun fetchPresets() = scope.launch { runCatching { send(FetchPresets) } }
+
+    /** Per-agent model lists from the daemon ([FetchModels] → [ModelsList]) — what the picker offers
+     *  beyond the static presets. Keyed by agent so a late reply can't cross-pollute another backend. */
+    val agentModels = mutableStateMapOf<AgentKind, ModelsList>()
+
+    fun fetchModels(agent: AgentKind = sessionAgent.value ?: AgentKind.CLAUDE) {
+        scope.launch { runCatching { send(FetchModels(agent = agent, workdir = workdir.value)) } }
+    }
 
     /** Create (null [id]) / update one preset. [token] is write-only plaintext (E2E protects the
      *  transport; the daemon stores it and only ever echoes a mask); null token on update = keep. */
@@ -2284,6 +2400,90 @@ class PocketRepository(private val scope: CoroutineScope, private val pinnedTo: 
         }
         scope.launch { send(FetchSkillCatalog(workdir.value)) }
     }
+
+    // ── headless bridges (issue #91 follow-up): the owner's IM-bot control plane ──
+    /** The daemon's bridges — the latest [BridgeListing]. */
+    val bridges = mutableStateListOf<BridgeInfo>()
+    /** True once the first [BridgeListing] of this session lands — "no bridges yet" vs. "still loading". */
+    val bridgesLoaded = mutableStateOf(false)
+    /** No reply — the daemon predates pocket/bridge.* and silently drops the unknown frame, so silence is
+     *  the only signal. Distinct from an EMPTY list: one says "update the daemon", the other "create one". */
+    val bridgesUnavailable = mutableStateOf(false)
+    /** The last create/revoke/runner error, for the page to surface verbatim. Cleared on the next request. */
+    val bridgeError = mutableStateOf<String?>(null)
+    /** A just-minted UNMANAGED credential the owner must copy out before its TTL lapses. Managed bridges
+     *  never set this — the daemon injected the ticket itself and there is nothing to hand over. */
+    val bridgeCredential = mutableStateOf<BridgeCredential?>(null)
+    val bridgeBusy = mutableStateOf(false)
+    /** Non-null = the last MERGE edit came back with env keys MISSING — the daemon is too old for partial
+     *  edits and replaced wholesale (the exact way a user once lost their app secret). The UI must shout,
+     *  not shrug: these keys now need re-entering. Cleared on the next bridge request. */
+    val bridgeMergeLost = mutableStateOf<List<String>?>(null)
+    private var pendingMergeCheck: Pair<String, Set<String>>? = null
+    private var bridgesDeadline: Job? = null
+    private var bridgeBusyDeadline: Job? = null
+
+    /** Arm a request: clear the last error and make sure a lost reply can't spin the page forever. */
+    private fun bridgeRequestStarted() {
+        bridgeBusy.value = true
+        bridgeError.value = null
+        bridgeMergeLost.value = null
+        bridgeBusyDeadline?.cancel()
+        bridgeBusyDeadline = scope.launch {
+            delay(10_000)
+            if (bridgeBusy.value) {
+                bridgeBusy.value = false
+                bridgeError.value = "the daemon didn't answer — try again"
+            }
+        }
+    }
+
+    fun fetchBridges() {
+        bridgesUnavailable.value = false
+        bridgesDeadline?.cancel()
+        bridgesDeadline = scope.launch {
+            delay(8_000)
+            if (!bridgesLoaded.value) bridgesUnavailable.value = true
+        }
+        scope.launch { send(ListBridges) }
+    }
+
+    /** Mint a bridge. [runner] non-null = the daemon manages the adapter process and the credential never
+     *  comes back to us (see [CreateBridge.runner]). */
+    fun createBridge(
+        name: String,
+        workdirs: List<String>,
+        tier: AccessTier = AccessTier.REVIEW,
+        maxSessions: Int? = null,
+        runner: BridgeRunnerSpec? = null,
+    ) {
+        bridgeRequestStarted()
+        bridgeCredential.value = null
+        scope.launch { send(CreateBridge(name, workdirs, maxSessions, tier = tier, runner = runner)) }
+    }
+
+    fun revokeBridge(name: String) {
+        bridgeRequestStarted()
+        scope.launch { send(RevokeBridge(name)) }
+    }
+
+    fun controlBridgeRunner(name: String, action: String) {
+        bridgeRequestStarted()
+        scope.launch { send(ControlBridgeRunner(name, action)) }
+    }
+
+    /** [mergeEnv] = the edit path: only non-blank env values land, everything else is kept daemon-side. */
+    fun configureBridgeRunner(name: String, spec: BridgeRunnerSpec, mergeEnv: Boolean = false) {
+        bridgeRequestStarted()
+        // arm the merge-loss guard: remember what WAS configured, so the reply can prove nothing vanished
+        pendingMergeCheck = if (mergeEnv) {
+            name to (bridges.firstOrNull { it.name == name }?.runner?.envKeys?.toSet() ?: emptySet())
+        } else null
+        scope.launch { send(ConfigureBridgeRunner(name, spec, mergeEnv)) }
+    }
+
+    /** Dismiss the one-shot credential card once the owner says they've copied it. */
+    fun clearBridgeCredential() { bridgeCredential.value = null }
 
     // ── scheduled tasks (issue #137): one-shot & repeat prompt deliveries the daemon fires ──
     /** The daemon's schedule list — the latest [ScheduleState]. */
@@ -2502,6 +2702,21 @@ class PocketRepository(private val scope: CoroutineScope, private val pinnedTo: 
         val dir = wd ?: sessionsDir.value ?: return
         scope.launch { send(GroupAssign(dir, sessionId, groupId)) }
     }
+
+    /** Rename session [sessionId]'s title (issue #158) — the daemon lands claude's own `custom-title`
+     *  record and answers with the re-pushed [Sessions] (same refresh contract as the group ops; no
+     *  optimistic local edit), or a [PocketError] when the rename can't land (e.g. the session is live
+     *  in another client). Gate the entry on [renameSupported]. */
+    fun renameSession(sessionId: String, title: String, wd: String? = null) {
+        val dir = wd ?: sessionsDir.value ?: return
+        if (title.isBlank()) return
+        renameTarget = sessionId // key a rename_failed answer back to the asking row
+        renameError.value = null // a fresh attempt clears the previous refusal
+        scope.launch { send(RenameSession(dir, sessionId, title.trim())) }
+    }
+
+    /** Dismiss the inline rename-refusal feedback (Esc on the sidebar's rename row). */
+    fun dismissRenameError() { renameError.value = null }
     // startMode defaults to the persisted default mode (mirrors effort), so tapping a session straight from
     // the list applies it too — not just the new-session picker.
     fun openSession(wd: String, resumeId: String? = null, startMode: PermissionMode = defaultMode.value, title: String? = null, agent: AgentKind = defaultAgent.value) = scope.launch {
@@ -2542,12 +2757,17 @@ class PocketRepository(private val scope: CoroutineScope, private val pinnedTo: 
         val openAgent = saved?.agent ?: agent // resumed sessions keep their backend; new ones use the picked default
         // new Claude sessions seed from the persisted default model; resumed keep their own, and a Codex launch
         // never inherits the (Claude-shaped) default id — it would be a meaningless --model to the Codex backend.
-        // OpenCode sessions get a model from the daemon-side default (model picker selection) — sending
-        // the Claude default to opencode would break the session.
-        val openModel = saved?.model ?: defaultModel.value?.takeIf { openAgent == AgentKind.CLAUDE }
+        val openModel = compatibleModelForAgent(openAgent, saved?.model) ?: when (openAgent) {
+            // New OpenCode sessions let the daemon choose from OpenCode config / `opencode models`.
+            AgentKind.OPENCODE -> null
+            else -> defaultModel.value?.takeIf { openAgent == AgentKind.CLAUDE }
+        }
         mode.value = openMode; allowRules.clear()
         model.value = openModel; effort.value = openEffort; contextUsed.value = null // reconciled by SessionLive
         sessionAgent.value = openAgent // optimistic; SessionLive corrects from daemon truth
+        // Pre-fetch OpenCode model list so the picker has it ready when the user opens it,
+        // rather than only fetching on picker-open (SessionSheets.kt ModelPicker LaunchedEffect).
+        fetchModels(openAgent)
         clearBackgroundJobs()
         Telemetry.track(TelEvent.SessionOpened, mapOf(TelKey.Resume to if (resumeId != null) 1 else 0))
         // lastEventSeq = 0 (never null, via lastEventSeqFor after the reset above): full replay, but it
@@ -2985,6 +3205,19 @@ class PocketRepository(private val scope: CoroutineScope, private val pinnedTo: 
         scope.launch { send(ListPathEntries(wd, subPath)) }
     }
 
+    /** Ask the daemon for the children under its HOME + [subPath] ('/'-joined, "" = home itself) for the
+     *  "open a project folder" browser (issue #152). Reuses the #75 listing frame anchored at the literal
+     *  "~" — only the daemon knows the remote machine's home, and its NIO resolve accepts '/' on Windows
+     *  too. The reply lands in [browseListing] only while it answers the LATEST request — a stale reply
+     *  from a drilled-past level is dropped at fold time (#152 复核), and the picker additionally keys
+     *  rendering on its own subPath. A guest credential gets a PocketError instead (GuestGuard denies the
+     *  "~" anchor), which the picker never sees — the entry is owner-only client-side and the daemon
+     *  stays the authority. */
+    fun browseHomeDirs(subPath: String) {
+        lastBrowseSub = subPath
+        scope.launch { send(ListPathEntries(BROWSE_HOME, subPath)) }
+    }
+
     // ── voice input actions ───────────────────────────────────────────────
 
     /** Mic tap (S1). Picks the engine: iOS native streaming dictation, else record→daemon-whisper. */
@@ -3251,11 +3484,16 @@ class PocketRepository(private val scope: CoroutineScope, private val pinnedTo: 
         }
     }
 
-    /** Switch the model — routed through the daemon's `/model` interception; applied on the next turn
-     *  (issue #84), never interrupting a running one. */
+    /** Switch the model — routed through the daemon's `/model` interception; applied on the next
+     *  turn (issue #84), never interrupting a running one. For OpenCode sessions, rejects models
+     *  that lack a provider prefix (e.g. "deepseek-chat", "sonnet") — those are Claude/gateway ids
+     *  and would cause silent launch hangs in the opencode backend. */
     fun switchModel(name: String) {
         val target = name.trim()
         if (convoId.value == null || target.isEmpty() || target == model.value) return
+        // Keep model ids scoped to the active agent. OpenCode requires provider/model, Codex uses
+        // Codex-shaped ids, and Claude remains permissive for gateway custom ids.
+        if (!isModelCompatibleWithAgent(sessionAgent.value ?: AgentKind.CLAUDE, target)) return
         model.value = target // optimistic; the daemon's next SessionLive corrects it to the resolved id
         switchViaCommand("/model $target")
     }
@@ -3360,8 +3598,9 @@ class PocketRepository(private val scope: CoroutineScope, private val pinnedTo: 
             // wire default (ask each step), ignoring the user's chosen mode (issue #50). Model/effort
             // still restore per-session, same as openSession.
             val saved = sessionParams[sid]
+            val agent = saved?.agent ?: sessionAgent.value ?: AgentKind.CLAUDE
             mode.value = defaultMode.value
-            send(OpenSession(wd, sid, model = saved?.model, mode = defaultMode.value, effort = saved?.effort ?: defaultEffort.value, takeOver = true, lastEventSeq = lastEventSeqFor(sid)))
+            send(OpenSession(wd, sid, model = compatibleModelForAgent(agent, saved?.model), mode = defaultMode.value, effort = saved?.effort ?: defaultEffort.value, takeOver = true, lastEventSeq = lastEventSeqFor(sid)))
         }
     }
 
@@ -3385,6 +3624,19 @@ class PocketRepository(private val scope: CoroutineScope, private val pinnedTo: 
     }
 
     internal companion object {
+        /** The folder browser's workdir anchor (issue #152): the literal "~" the daemon expands to ITS
+         *  home. Also the [PathEntries] routing key that separates browser replies from @-completion
+         *  ones — a real session's workdir is never the bare "~" (SessionLive carries the resolved path). */
+        const val BROWSE_HOME = "~"
+
+        /** #152 复核 (pure, for tests): fold a home-browse [PathEntries] reply into the held browseListing.
+         *  Replies can arrive out of order over the relay (drill fast → a drilled-past level's slow reply
+         *  lands AFTER the current level's), so only the reply answering the LATEST request ([lastSub]) is
+         *  accepted; a stale one is dropped. Letting it clobber the fresh listing would strand the picker
+         *  on the loading skeleton forever — browseRows keys on subPath and no request is pending to
+         *  repair it. */
+        fun foldBrowseReply(held: PathEntries?, reply: PathEntries, lastSub: String?): PathEntries? =
+            if (reply.subPath == lastSub) reply else held
         const val FIRST_GRACE_MS = 2_000L     // first connect: show the skeleton this long before "can't reach server"
         const val RECONNECT_GRACE_MS = 6_000L // a reconnect already keeps the old list under a banner
         const val RECONNECT_BANNER_GRACE_MS = 2_500L // hold the Ready look this long on a blip before the Reconnecting banner (#28)

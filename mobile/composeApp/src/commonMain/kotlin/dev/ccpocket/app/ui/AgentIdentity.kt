@@ -14,6 +14,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
@@ -42,9 +43,9 @@ fun agentName(agent: AgentKind): String = when (agent) {
     else -> "Claude"
 }
 fun agentTagline(agent: AgentKind): String = when (agent) {
-    AgentKind.CODEX -> "Codex \u00b7 OpenAI"
-    AgentKind.OPENCODE -> "OpenCode \u00b7 Open Source"
-    else -> "Claude Code \u00b7 Anthropic"
+    AgentKind.CODEX -> "Codex · OpenAI"
+    AgentKind.OPENCODE -> "OpenCode · Open Source"
+    else -> "Claude Code · Anthropic"
 }
 
 /** The two standard agent-color tints — a 12% fill + a 42% border — shared by the chip and the selection cards. */
@@ -68,17 +69,15 @@ fun AgentGlyph(agent: AgentKind, color: Color = agentColor(agent), size: Int = 1
             drawArc(color, startAngle = 90f, sweepAngle = 90f, useCenter = false, topLeft = box, size = d, style = Stroke(width = w, cap = StrokeCap.Round))
         } else if (agent == AgentKind.OPENCODE) {
             val w = 1.6f * s
-            // hexagon glyph — represents OpenCode's structured, modular nature
-            val cx = 10f; val cy = 10f; val r = 6.5f
-            val pts = (0..5).map { i ->
-                val angleRad = (60.0 * i - 90.0) * kotlin.math.PI / 180.0
-                Offset(cx + r * kotlin.math.cos(angleRad).toFloat() * s, cy + r * kotlin.math.sin(angleRad).toFloat() * s)
-            }
-            for (i in pts.indices) {
-                drawLine(color, pts[i], pts[(i + 1) % pts.size], strokeWidth = w, cap = StrokeCap.Round)
-            }
-            // inner dot
-            drawCircle(color, radius = 1.5f * s, center = p(10f, 10f))
+            val innerColor = color.copy(alpha = 0.3f)
+            drawRoundRect(
+                color = color, topLeft = p(3f, 2f), size = Size(14f * s, 16f * s),
+                cornerRadius = CornerRadius(1.5f * s, 1.5f * s), style = Stroke(width = w)
+            )
+            drawRoundRect(
+                color = innerColor, topLeft = p(5f, 10f), size = Size(10f * s, 7f * s),
+                cornerRadius = CornerRadius(1f * s, 1f * s)
+            )
         } else {
             val w = 1.8f * s
             // chevron ">"
@@ -108,7 +107,7 @@ fun AgentTag(agent: AgentKind, small: Boolean = true) {
     }
 }
 
-/** Header / list-row badge: shows the tag ONLY for the non-default Codex (Claude stays unmarked), with a leading [gap]. */
+/** Header / list-row badge: the DEFAULT Claude stays unmarked; every other agent (Codex, OpenCode, …) shows its tag, with a leading [gap]. */
 @Composable
 fun AgentBadge(agent: AgentKind?, gap: Dp = 6.dp) {
     if (agent != null && agent != AgentKind.CLAUDE) {

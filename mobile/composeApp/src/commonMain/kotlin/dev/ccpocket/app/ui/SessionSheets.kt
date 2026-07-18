@@ -1,5 +1,7 @@
 package dev.ccpocket.app.ui
 
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -15,6 +17,7 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
@@ -31,9 +34,17 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.StrokeJoin
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -48,26 +59,19 @@ import dev.ccpocket.protocol.DEFAULT_CONTEXT_WINDOW
 import dev.ccpocket.protocol.JobKind
 import dev.ccpocket.protocol.JobStatus
 import dev.ccpocket.protocol.AgentKind
+import dev.ccpocket.protocol.CODEX_MODEL_IDS
+import dev.ccpocket.protocol.isModelCompatibleWithAgent
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.draw.alpha
 import kotlinx.coroutines.delay
 import org.jetbrains.compose.resources.stringResource
 
 // ── model + effort option sets (what `--model` / `--effort` accept) ──
-internal val CODEX_MODEL_OPTIONS = listOf("gpt-5.1-codex", "gpt-5.1-codex-mini", "gpt-5-codex") // Codex sessions get Codex models; shared with the desktop ⋯ popover
-internal val OPENCODE_MODEL_OPTIONS = listOf(
-    "opencode/deepseek-v4-flash-free",
-    "opencode/hy3-free",
-    "opencode/mimo-v2.5-free",
-    "opencode/nemotron-3-ultra-free",
-    "opencode/north-mini-code-free",
-    "opencode/big-pickle",
-    "zhipuai/glm-4.5",
-    "zhipuai/glm-4.7",
-    "zhipuai/glm-5",
-    "zhipuai/glm-5.1",
-    "zhipuai/glm-5.2",
-)
+internal val CODEX_MODEL_OPTIONS = CODEX_MODEL_IDS // Codex sessions get Codex models; shared with the desktop ⋯ popover
+// NO static OpenCode options on purpose: opencode's usable models are whatever PROVIDERS this
+// user configured (free catalogs also rotate weekly) — a hardcoded list is someone else's setup
+// and every wrong row is a launch failure. The picker shows the daemon's `opencode models` answer
+// (FetchModels) or an explicit empty/error state, never a guess.
 internal val CLAUDE_MODEL_OPTIONS = listOf("Fable" to "fable", "Opus" to "opus", "Sonnet" to "sonnet", "Haiku" to "haiku") // display name → alias; shared by both shells' pickers
 internal val EFFORT_OPTIONS = listOf("low", "medium", "high", "xhigh", "max") // shared: live /effort picker + Settings default
 
@@ -76,6 +80,37 @@ fun modelAlias(model: String?): String {
     val m = model?.trim().orEmpty()
     if (m.isEmpty()) return ""
     return m.removePrefix("claude-").takeWhile { it != '-' && it != '[' && it != '_' }.ifBlank { m }
+}
+
+/** Agent-aware display label: Claude gets aliases, Codex/OpenCode keep their full model ids
+ *  (an alias-shaped collapse of "zhipuai/glm-5" would misname it "zhipuai"). Shows the model the
+ *  daemon REPORTS verbatim — no compat filtering on the display path. */
+fun modelLabelForAgent(agent: AgentKind?, model: String?): String {
+    val m = model?.trim().orEmpty()
+    if (m.isEmpty()) return ""
+    return when (agent ?: AgentKind.CLAUDE) {
+        AgentKind.CLAUDE -> modelAlias(m)
+        AgentKind.CODEX, AgentKind.OPENCODE -> m
+    }
+}
+
+/** Middle-truncate a long model id for the composer chip ("deepseek-chat-v3.2" → "deepseek…v3.2"):
+ *  head + tail keep both the vendor and the variant readable while the chip's width holds steady
+ *  (issue #157, design model-chip.jsx). ≤ head+tail+1 chars pass through — swapping one character
+ *  for '…' would save nothing. */
+internal fun midTruncateModel(id: String, head: Int = 8, tail: Int = 4): String =
+    if (id.length <= head + tail + 1) id else id.take(head) + "…" + id.takeLast(tail)
+
+/** The composer chip's label (issue #157): Claude-family ids collapse to their short alias exactly
+ *  like the header meta line; anything else (gateway/custom/Codex ids) keeps the REAL id, middle-
+ *  truncated — [modelAlias] would misname "deepseek-chat" as "deepseek". Blank in = blank out
+ *  (callers fall back to the "account default" placeholder, same as the header). */
+internal fun modelChipLabel(model: String?): String {
+    val m = model?.trim().orEmpty()
+    if (m.isEmpty()) return ""
+    val claudeFamily = m.startsWith("claude-", ignoreCase = true) ||
+        CLAUDE_MODEL_OPTIONS.any { (_, alias) -> alias.equals(m, ignoreCase = true) }
+    return if (claudeFamily) modelAlias(m) else midTruncateModel(m)
 }
 
 /** Compact human token count: 45200 -> "45k", 1000000 -> "1.0M" (one decimal, truncated). */
@@ -168,7 +203,7 @@ fun QuickActionsSheet(repo: PocketRepository, onTerminal: () -> Unit, onMode: ()
                 QaSub.MAIN -> {
                     Text(stringResource(Res.string.quick_actions_title), color = Tok.tx, fontSize = 20.sp, fontWeight = FontWeight.Bold)
                     Column(Modifier.padding(top = 10.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                        ActionRow(stringResource(Res.string.qa_model), value = modelAlias(repo.model.value).ifBlank { stringResource(Res.string.value_default) }, chevron = true) { sub = QaSub.MODEL }
+                        ActionRow(stringResource(Res.string.qa_model), value = modelChipLabel(repo.model.value).ifBlank { stringResource(Res.string.value_default) }, chevron = true) { sub = QaSub.MODEL }
                         ActionRow(stringResource(Res.string.label_effort), value = repo.effort.value ?: stringResource(Res.string.value_default), chevron = true) { sub = QaSub.EFFORT }
                         // the permission-mode switch lives here now (was a persistent header badge — one
                         // more thing crowding the top bar for a setting touched a few times per session)
@@ -198,6 +233,60 @@ fun QuickActionsSheet(repo: PocketRepository, onTerminal: () -> Unit, onMode: ()
                     onBack = { sub = QaSub.MAIN },
                 ) { repo.switchEffort(it); onDismiss() }
             }
+        }
+    }
+}
+
+/**
+ * The composer's quiet model chip (issue #157, design model-chip.jsx): hairline pill on the raised
+ * surface, mono 11sp label (middle-truncated id) capped at ~82dp, chevron-up that flips while its
+ * picker is open (the border warms to accent). Dimmed + disabled while a turn streams — a switch
+ * would only land on the NEXT turn anyway. Never accent-filled: send stays the loudest control.
+ * Shared by both shells (mobile composer + desktop ChatPane).
+ */
+@Composable
+internal fun ModelChip(label: String, open: Boolean, enabled: Boolean, contentDescription: String, onClick: () -> Unit) {
+    val chev by animateFloatAsState(if (open) 180f else 0f, label = "chipChevron")
+    val cd = contentDescription
+    Row(
+        Modifier.height(30.dp).clip(RoundedCornerShape(999.dp)).background(Tok.raised)
+            .border(1.dp, if (open) Tok.accent else Tok.hair, RoundedCornerShape(999.dp))
+            .clickable(enabled = enabled, onClick = onClick)
+            .alpha(if (enabled) 1f else 0.42f)
+            .padding(start = 10.dp, end = 8.dp)
+            .semantics { this.contentDescription = cd },
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            label, color = Tok.tx2, fontFamily = FontFamily.Monospace, fontSize = 11.sp,
+            maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.widthIn(max = 82.dp),
+        )
+        Spacer(Modifier.width(5.dp))
+        ChevronUpGlyph(Tok.muted, Modifier.size(12.dp).rotate(chev))
+    }
+}
+
+/** 12dp chevron-up stroke (design: M3 9l4-4 4 4 in a 14-box) — drawn, not a text glyph, so the
+ *  open-state 180° flip stays optically centered. */
+@Composable
+private fun ChevronUpGlyph(tint: Color, modifier: Modifier) {
+    Canvas(modifier) {
+        val p = Path().apply {
+            moveTo(size.width * 0.21f, size.height * 0.64f)
+            lineTo(size.width * 0.50f, size.height * 0.36f)
+            lineTo(size.width * 0.79f, size.height * 0.64f)
+        }
+        drawPath(p, tint, style = Stroke(width = 1.7.dp.toPx(), cap = StrokeCap.Round, join = StrokeJoin.Round))
+    }
+}
+
+/** The chip's direct model sheet (issue #157): the SAME [ModelPicker] the quick-actions page hosts,
+ *  one level shallower — opens straight on the rows (no back affordance), closes on done/scrim. */
+@Composable
+fun ModelSheet(repo: PocketRepository, onDismiss: () -> Unit) {
+    PocketSheet(onDismiss) {
+        Column(Modifier.padding(horizontal = 16.dp).padding(bottom = 14.dp, top = 4.dp)) {
+            ModelPicker(repo, onBack = null, onDone = onDismiss)
         }
     }
 }
@@ -253,29 +342,41 @@ private fun CtxPill(ctx: String, big: Boolean) {
 }
 
 /**
- * Model picker (design cc-pocket/Model Picker.html) — reached from Quick actions → Model (NOT a new top-bar
- * button; the bar is already busy). Rich rows: display name + mono `--model` value + a 1M/200K context pill +
+ * Model picker (design cc-pocket/Model Picker.html) — reached from Quick actions → Model AND, one level
+ * shallower, straight from the composer's model chip via [ModelSheet] (issue #157; onBack = null there —
+ * direct open, direct close). Rich rows: display name + mono `--model` value + a 1M/200K context pill +
  * a check. Tapping starts a switch: the row shows a spinner while the daemon relaunches; the sheet closes once
  * the model is re-announced (or after a short timeout, so it never hangs). Claude uses the real opus/sonnet/haiku
  * aliases; Codex sessions list Codex model ids.
  */
 @Composable
-internal fun ModelPicker(repo: PocketRepository, onBack: () -> Unit, onDone: () -> Unit) { // internal (was private) so desktopTest's ShowcaseRender can compose it — SessionsScreen/ChatScreen precedent
+internal fun ModelPicker(repo: PocketRepository, onBack: (() -> Unit)?, onDone: () -> Unit) { // internal (was private) so desktopTest's ShowcaseRender can compose it — SessionsScreen/ChatScreen precedent
     val codex = repo.sessionAgent.value == AgentKind.CODEX
     val opencode = repo.sessionAgent.value == AgentKind.OPENCODE
-    val choices = if (codex) CODEX_MODEL_OPTIONS.map { ModelChoice(it, it, it, "", false) }
-    else if (opencode) OPENCODE_MODEL_OPTIONS.map { ModelChoice(it, it, it, "", false) }
+    val agent = repo.sessionAgent.value ?: AgentKind.CLAUDE
+    // Fetch dynamic model list from the daemon when any agent picker opens.
+    LaunchedEffect(agent) { repo.fetchModels(agent) }
+    val agentModels = repo.agentModels[agent]
+    val choices = if (codex) {
+        // daemon list first (real cache: configured default leads, includes ids the static trio lacks);
+        // static trio only until it answers. A list may ride WITH an error (last-good + failed refresh).
+        val visibleModels = agentModels?.models?.takeIf { it.isNotEmpty() } ?: CODEX_MODEL_OPTIONS
+        visibleModels.map { ModelChoice(it, it, it, "", false) }
+    } else if (opencode) {
+        // daemon truth or nothing (see the OPTIONS note above) — the empty state renders below
+        (agentModels?.models ?: emptyList()).map { m -> ModelChoice(m, m, m, "", false) }
+    }
     // window pill derives from the protocol table, so registering a new alias THERE is the only edit
     else CLAUDE_MODEL_OPTIONS.map { (name, alias) ->
         val big = contextWindowFor(alias) == LARGE_CONTEXT_WINDOW
         ModelChoice(name, alias, alias, if (big) "1M" else "200K", big)
     }
-    val selected = if (codex) repo.model.value else modelAlias(repo.model.value)
+    val selected = if (codex || opencode) repo.model.value else modelAlias(repo.model.value)
     var switchingTo by remember { mutableStateOf<String?>(null) }
     // close once the daemon confirms the switch (model re-announced through SessionLive)…
     LaunchedEffect(switchingTo, repo.model.value) {
         val target = switchingTo ?: return@LaunchedEffect
-        val now = if (codex) repo.model.value else modelAlias(repo.model.value)
+        val now = if (codex || opencode) repo.model.value else modelAlias(repo.model.value)
         // raw compare too: a custom id ("kimi-k2…") never alias-matches, but the daemon echoes it verbatim
         if (now.equals(target, ignoreCase = true) || repo.model.value?.equals(target, ignoreCase = true) == true) onDone()
     }
@@ -283,16 +384,28 @@ internal fun ModelPicker(repo: PocketRepository, onBack: () -> Unit, onDone: () 
     LaunchedEffect(switchingTo) { if (switchingTo != null) { delay(4000); onDone() } }
 
     Row(verticalAlignment = Alignment.CenterVertically) {
-        Text("‹ ", color = Tok.tx2, fontSize = 18.sp, modifier = Modifier.clickable(enabled = switchingTo == null, onClick = onBack).padding(end = 4.dp))
+        // chip-direct opens (ModelSheet) have no quick-actions page to go back to — the title stands alone
+        if (onBack != null) Text("‹ ", color = Tok.tx2, fontSize = 18.sp, modifier = Modifier.clickable(enabled = switchingTo == null, onClick = onBack).padding(end = 4.dp))
         Text(stringResource(Res.string.qa_model), color = Tok.tx, fontSize = 20.sp, fontWeight = FontWeight.Bold)
     }
     // Gateway model presets (issue #139): one-tap vendor ids for third-party gateway users. When the
     // daemon reports a gateway ANTHROPIC_BASE_URL (DaemonInfo) the section LEADS the picker — those
     // users pick vendor ids, not Claude aliases. On the official endpoint it sits behind a collapsed
     // toggle below, so the sheet keeps today's size for everyone else. Claude sessions only: Codex
-    // model routing doesn't go through ANTHROPIC_BASE_URL.
-    val gatewayUrl = if (codex) null else repo.gatewayBaseUrl.value
+    // model routing doesn't go through ANTHROPIC_BASE_URL, and OpenCode has its own model format
+    // (provider/name) — gateway presets would send bare ids like "deepseek-chat" that cause hangs.
+    val gatewayUrl = if (codex || opencode) null else repo.gatewayBaseUrl.value
     val pickPreset: (String) -> Unit = { switchingTo = it; repo.switchModel(it) }
+    // opencode has NO static fallback rows: surface the fetch error / loading state explicitly
+    // instead of a silent blank (or worse, a catalog of models this user's providers can't run)
+    if (opencode && (agentModels?.error != null || choices.isEmpty())) {
+        Column(Modifier.padding(top = 10.dp)) {
+            agentModels?.error?.let { Text(it, color = Tok.danger, fontSize = 12.sp, lineHeight = 16.sp) }
+            if (choices.isEmpty() && agentModels?.error == null) {
+                Text(stringResource(Res.string.opencode_models_loading), color = Tok.muted, fontSize = 12.5.sp)
+            }
+        }
+    }
     if (gatewayUrl != null) {
         GatewayPresetSection(repo, gatewayUrl, switchingTo, pickPreset)
         // the alias list becomes the picker's second group, so it earns a divider + its own label (0714 design)
@@ -346,6 +459,8 @@ internal fun ModelPicker(repo: PocketRepository, onBack: () -> Unit, onDone: () 
     // the session already runs an id outside the presets, with the same ✓/spinner the preset rows use.
     val presetActive = choices.any { it.pick.equals(selected, ignoreCase = true) }
     val customActive = !presetActive && !repo.model.value.isNullOrBlank()
+    // NOT keyed on the live model: an external switch (another device's /model, SessionLive echo)
+    // must never wipe an id the user is mid-typing here
     var custom by remember { mutableStateOf(if (customActive) repo.model.value.orEmpty() else "") }
     Column(Modifier.padding(top = 12.dp)) {
         Text(stringResource(Res.string.model_custom_label), color = Tok.muted, fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold)
@@ -360,11 +475,14 @@ internal fun ModelPicker(repo: PocketRepository, onBack: () -> Unit, onDone: () 
             Box(Modifier.width(40.dp), contentAlignment = Alignment.Center) {
                 val t = custom.trim()
                 val isSwitchingCustom = switchingTo != null && switchingTo.equals(t, ignoreCase = true) && !presetActive
+                // the arrow appears only for ids the backend can take at all (opencode: provider/model;
+                // codex: not a Claude alias) — the ONE surface where the compat guard gates a user action
+                val canSwitchCustom = t.isNotEmpty() && isModelCompatibleWithAgent(agent, t)
                 when {
                     isSwitchingCustom -> CircularProgressIndicator(Modifier.size(17.dp), color = Tok.accent, strokeWidth = 2.dp)
                     customActive && t.equals(repo.model.value, ignoreCase = true) && switchingTo == null ->
                         Text("✓", color = Tok.accent, fontSize = 16.sp, fontWeight = FontWeight.Bold)
-                    t.isNotEmpty() && switchingTo == null -> Text(
+                    canSwitchCustom && switchingTo == null -> Text(
                         "→", color = Tok.accent, fontSize = 18.sp, fontWeight = FontWeight.Bold,
                         modifier = Modifier.clip(RoundedCornerShape(8.dp))
                             .clickable { switchingTo = t; repo.switchModel(t) }.padding(6.dp),
@@ -374,8 +492,9 @@ internal fun ModelPicker(repo: PocketRepository, onBack: () -> Unit, onDone: () 
         }
     }
     // no gateway detected: the same preset rows wait behind ONE quiet disclosure row at the very end
-    // (0714 design) — official-endpoint users keep today's picker, no gateway chrome above it
-    if (!codex && gatewayUrl == null) {
+    // (0714 design) — official-endpoint users keep today's picker, no gateway chrome above it.
+    // Claude only: gateway presets are bare vendor ids, meaningless to codex and a hang for opencode.
+    if (!codex && !opencode && gatewayUrl == null) {
         var showGateway by remember { mutableStateOf(false) }
         Column(Modifier.padding(top = 14.dp)) {
             Hairline()
@@ -399,7 +518,11 @@ internal fun ModelPicker(repo: PocketRepository, onBack: () -> Unit, onDone: () 
                 CircularProgressIndicator(Modifier.size(13.dp), color = Tok.accent, strokeWidth = 2.dp)
                 Spacer(Modifier.width(8.dp))
                 Text(stringResource(Res.string.model_switching), color = Tok.tx2, fontFamily = FontFamily.Monospace, fontSize = 11.5.sp)
-            } else Text(stringResource(Res.string.model_switch_hint), color = Tok.muted, fontSize = 12.5.sp)
+            } else Column {
+                // mid-turn (issue #157): the running turn keeps its model — say the pick lands NEXT turn
+                if (repo.streaming.value) Text(stringResource(Res.string.model_next_turn_note), color = Tok.tx2, fontSize = 12.5.sp, modifier = Modifier.padding(bottom = 6.dp))
+                Text(stringResource(Res.string.model_switch_hint), color = Tok.muted, fontSize = 12.5.sp)
+            }
         }
     }
 }

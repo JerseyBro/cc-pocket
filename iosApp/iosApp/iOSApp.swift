@@ -46,12 +46,31 @@ class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDele
     func application(_ application: UIApplication,
                      didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data) {
         let hex = deviceToken.map { String(format: "%02x", $0) }.joined()
-        #if DEBUG
-        let platform = "apns_sandbox" // development APNs → relay sends via api.sandbox.push.apple.com
-        #else
-        let platform = "apns"
-        #endif
+        // Which APNs environment issued this token decides which endpoint the relay must send to
+        // (sandbox vs production). It is a property of the ENTITLEMENT (aps-environment), NOT of the
+        // compile configuration — so `#if DEBUG` is the wrong axis and silently mis-tags a fir/ad-hoc
+        // build (Release-compiled but development-entitled): a sandbox token gets labelled "apns",
+        // the relay tries api.push.apple.com, APNs answers 410, the relay prunes the token, and the
+        // phone goes permanently silent. Read the entitlement at runtime instead.
+        let platform = Self.apnsIsSandbox() ? "apns_sandbox" : "apns"
         MainViewControllerKt.setPushToken(platform: platform, token: hex)
+    }
+
+    /// True when this build's aps-environment is `development` (→ sandbox APNs). Determined from the
+    /// embedded provisioning profile: App Store builds have NO `embedded.mobileprovision`, so their
+    /// absence IS the "production" signal; Debug / Ad-hoc / fir builds carry one naming the environment.
+    private static func apnsIsSandbox() -> Bool {
+        // .isoLatin1, NOT .ascii: the profile is a CMS/DER container with bytes >127, so an .ascii decode
+        // returns nil for the whole file — which silently fell through to "production", labelled a sandbox
+        // token "apns", and earned a BadDeviceToken from APNs. isoLatin1 maps every byte 1:1 and never fails.
+        guard let url = Bundle.main.url(forResource: "embedded", withExtension: "mobileprovision"),
+              let data = try? Data(contentsOf: url),
+              let text = String(data: data, encoding: .isoLatin1)
+        else { return false } // no profile → App Store → production
+        // the profile is CMS-wrapped; a substring scan of its plist body is the pragmatic, dependency-free read
+        guard let range = text.range(of: "aps-environment") else { return false }
+        let after = text[range.upperBound...].prefix(64)
+        return after.contains("development")
     }
 
     func application(_ application: UIApplication,
@@ -85,26 +104,17 @@ struct iOSApp: App {
     init() {
         // Firebase stays in Swift (the only place that imports it); the shared Kotlin Telemetry
         // calls back through the sink registered below — mirroring cc-dashboard's single seam.
-        // The GoogleService-Info.plist is gitignored; dev builds use a placeholder template.
-        // Only configure Firebase when a real API key is present (39-char "AIza..." format) to
-        // avoid the Firebase Installations crash on invalid keys.
-        if let path = Bundle.main.path(forResource: "GoogleService-Info", ofType: "plist"),
-           let dict = NSDictionary(contentsOfFile: path) as? [String: Any],
-           let apiKey = dict["API_KEY"] as? String,
-           apiKey.count == 39 && apiKey.hasPrefix("AIza")
-        {
-            FirebaseApp.configure()
-            Analytics.setAnalyticsCollectionEnabled(true)
-            MainViewControllerKt.setTelemetrySink(
-                onEvent: { event, params in
-                    Analytics.logEvent(event, parameters: params)
-                },
-                onError: { message, phase in
-                    let info: [String: Any] = [NSLocalizedDescriptionKey: message, "phase": phase ?? ""]
-                    Crashlytics.crashlytics().record(error: NSError(domain: "ccpocket", code: 0, userInfo: info))
-                }
-            )
-        }
+        FirebaseApp.configure()
+        Analytics.setAnalyticsCollectionEnabled(true) // plist ships IS_ANALYTICS_ENABLED=false; opt in here
+        MainViewControllerKt.setTelemetrySink(
+            onEvent: { event, params in
+                Analytics.logEvent(event, parameters: params)
+            },
+            onError: { message, phase in
+                let info: [String: Any] = [NSLocalizedDescriptionKey: message, "phase": phase ?? ""]
+                Crashlytics.crashlytics().record(error: NSError(domain: "ccpocket", code: 0, userInfo: info))
+            }
+        )
         // Push registration lives in Swift (UIKit symbols aren't uniform across Kotlin/Native targets).
         // Kotlin's PushController calls this when registration starts (after pairing), so the prompt
         // follows pairing rather than firing at cold launch.
